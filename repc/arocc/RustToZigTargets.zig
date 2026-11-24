@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const CrossTarget = std.zig.CrossTarget;
-var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
 const Target = std.Target;
 const Arch = std.Target.Cpu.Arch;
 const Cpu = std.Target.Cpu;
@@ -22,14 +21,18 @@ const FindTarget = struct {
     abi: ?Abi = null,
 };
 
-pub fn main() !void {
-    const gpa = general_purpose_allocator.allocator();
-    defer if (general_purpose_allocator.deinit()) std.process.exit(1);
-    const o_file = try std.fs.cwd().createFile("mapping.text", .{});
-    defer o_file.close();
-    const out = o_file.writer();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const arena = init.arena.allocator();
+    const io = init.io;
 
-    const rustc = try std.ChildProcess.exec(.{ .allocator = gpa, .argv = &.{
+    const o_file = try std.Io.Dir.cwd().createFile(io, "mapping.text", .{});
+    defer o_file.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var out_file_writer = o_file.writer(io, &out_buf);
+    const out = &out_file_writer.interface;
+
+    const rustc = try std.process.run(gpa, io, .{ .argv = &.{
         "rustc",
         "--print",
         "target-list",
@@ -41,44 +44,41 @@ pub fn main() !void {
 
     // make a unique list from rustc as well
     // has the hard-coded targets from repr-c
-    var rust_targets = std.StringArrayHashMap(void).init(gpa);
-    defer rust_targets.deinit();
+    var rust_targets: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer rust_targets.deinit(gpa);
     // mutiple rust targets can map to the same
     // zig target. Keep track of the mappings
     // so we can find and eliminate these rust
     // targets
-    var mapping = std.StringArrayHashMap(std.ArrayList([]const u8)).init(gpa);
-    defer mapping.deinit();
+    var mapping: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+    defer mapping.deinit(gpa);
 
-    var rust_t = std.mem.tokenize(u8, rustc.stdout, "\n");
+    var rust_t = std.mem.tokenizeScalar(u8, rustc.stdout, '\n');
     while (rust_t.next()) |target| {
-        try rust_targets.put(target, {});
+        try rust_targets.put(gpa, target, {});
     }
     for (static_list) |target| {
-        try rust_targets.put(target, {});
+        try rust_targets.put(gpa, target, {});
     }
     var it = rust_targets.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
-        var z_target = try gpa.alloc(u8, 128);
-        var strm = std.io.fixedBufferStream(z_target);
-        if (try resolveTarget(key, strm.writer())) {
-            const ent = try mapping.getOrPut(strm.getWritten());
+        const z_target = try arena.alloc(u8, 128);
+        var strm: std.Io.Writer = .fixed(z_target);
+        if (try resolveTarget(key, &strm)) {
+            const ent = try mapping.getOrPut(gpa, strm.buffered());
             if (!ent.found_existing) {
-                ent.value_ptr.* = std.ArrayList([]const u8).init(gpa);
-            } else {
-                gpa.free(z_target);
+                ent.value_ptr.* = .empty;
             }
-            try ent.value_ptr.append(key);
+            try ent.value_ptr.append(arena, key);
         } else {
-            gpa.free(z_target);
             std.debug.print("no target for {s}\n", .{key});
         }
     }
     var k_itr = mapping.iterator();
     while (k_itr.next()) |entry| {
         const k = entry.key_ptr.*;
-        const v = entry.value_ptr.*;
+        const v = entry.value_ptr;
         if (v.items.len > 1) {
             std.debug.print("multi {s} : ", .{k});
             for (v.items) |i| {
@@ -92,15 +92,14 @@ pub fn main() !void {
             try out.print("{s}:{s}\n", .{ t, k });
             // std.debug.print("single {s} : {s}\n", .{ k.*, v.items[0] });
         }
-        v.deinit();
-        gpa.free(k);
     }
+    try out.flush();
 }
-fn resolveTarget(target: []const u8, writer: anytype) !bool {
+fn resolveTarget(target: []const u8, writer: *std.Io.Writer) !bool {
     var fill: FindTarget = .{};
 
     // std.debug.print("{s} || ", .{target});
-    var ittr = std.mem.split(u8, target, "-");
+    var ittr = std.mem.splitScalar(u8, target, '-');
     var last: []const u8 = undefined;
     while (ittr.next()) |part| {
         last = part;
@@ -123,12 +122,12 @@ fn resolveTarget(target: []const u8, writer: anytype) !bool {
     // ok. see if we can make a useful target out of all of this.
     if (fill.arch) |arch| {
         fill.os = fill.os orelse Os.Tag.other;
-        fill.model = fill.model orelse Model.baseline(arch);
         const end_os: Os = .{
             .tag = fill.os.?,
             .version_range = .{ .none = {} },
         };
-        fill.abi = fill.abi orelse Abi.default(arch, end_os);
+        fill.abi = fill.abi orelse Abi.default(arch, end_os.tag);
+        fill.model = fill.model orelse Model.baseline(arch, end_os, fill.abi.?);
         try writer.print("{s}-{s}-{s}-{s}", .{
             @tagName(fill.arch.?),
             fill.model.?.name,
@@ -219,7 +218,7 @@ fn searchArch(raw: []const u8, res: *FindTarget) void {
             // so trip the isa
             if (a == Arch.mips and std.mem.startsWith(u8, maybeModel, "isa")) {
                 maybeModel = maybeModel[3..];
-            } else if (Arch.isRISCV(a)) {
+            } else if (Arch.isRiscv(a)) {
                 // strip off leading "i" if exists
                 // zig doesn't support expiremtnal ISA's ATM.
                 if (maybeModel[0] == 'i') {
@@ -251,8 +250,8 @@ fn searchRiscV(sub: []const u8, arch: Arch, fill: *FindTarget) void {
     }
     var f_union: Feature.Set = std.mem.zeroes(Feature.Set);
     const allFeat = arch.allFeaturesList();
-    const has64 = allFeat[@enumToInt(std.Target.riscv.Feature.@"64bit")];
-    for (sub) |_, idx| {
+    const has64 = allFeat[@backingInt(std.Target.riscv.Feature.@"64bit")];
+    for (sub, 0..) |_, idx| {
         const check = sub[idx .. idx + 1];
         for (allFeat) |hay| {
             if (eqlIgnoreCase(hay.name, check) or
@@ -273,7 +272,7 @@ fn searchRiscV(sub: []const u8, arch: Arch, fill: *FindTarget) void {
         var m_union: Feature.Set = std.mem.zeroes(Feature.Set);
         featuresUnion(mod, arch, &m_union);
         var match = true;
-        for (m_union.ints) |_, idx| {
+        for (m_union.ints, 0..) |_, idx| {
             const mi = m_union.ints[idx];
             const fi = f_union.ints[idx];
             if (mi & fi != fi) {
@@ -334,19 +333,22 @@ const FeatureIterator = struct {
 
     pub fn next(self: *Self) ?Set.Index {
         // no ffs, so ctz+1
-        const ffs = @intCast(usize, @ctz(self.current));
-        if (ffs >= @bitSizeOf(usize)) {
-            // have we checked the whole array?
-            if (self.ints_indx == 0) return null;
-            // load the next one and try again
-            self.ints_indx -= 1;
-            self.current = self.set.ints[self.ints_indx];
-            return @call(.{ .modifier = .always_tail }, next, .{self});
-        }
+        const ffs: usize = blk: while (true) {
+            const ffs = @ctz(self.current);
+            if (ffs >= @bitSizeOf(usize)) {
+                // have we checked the whole array?
+                if (self.ints_indx == 0) return null;
+                // load the next one and try again
+                self.ints_indx -= 1;
+                self.current = self.set.ints[self.ints_indx];
+                continue;
+            }
+            break :blk ffs;
+        };
         // clear the bit we're about to return
         self.current &= (self.current - 1);
         const ret = ffs + (@bitSizeOf(usize) * (self.ints_indx));
-        return @intCast(Set.Index, ret);
+        return @intCast(ret);
     }
 };
 
@@ -369,23 +371,8 @@ pub fn count(set: Set) usize {
 /// a union of all the features and their dependencies.
 pub fn featuresUnion(model: *const Model, arch: Arch, result: *Feature.Set) void {
     // start empty
-    std.mem.set(usize, &result.ints, 0);
-    walkFeatures(model.features, arch, result);
-}
-fn walkFeatures(node: Feature.Set, arch: Arch, result: *Feature.Set) void {
-    for (result.ints) |*item, idx| {
-        item.* |= node.ints[idx];
-    }
-    var itr = featureIndexIterator(node);
-    while (itr.next()) |f_index| {
-        const next_node = arch.allFeaturesList()[f_index];
-        if (!next_node.dependencies.isEmpty()) {
-            // if there is a loop in this graph, this will
-            // blow the stack. But 'zig targets' runs, and that
-            // dumps the whole graph.
-            walkFeatures(next_node.dependencies, arch, result);
-        }
-    }
+    result.* = model.features;
+    result.populateDependencies(arch.allFeaturesList());
 }
 
 pub fn hasFeature(model: *const Model, feature: Feature, arch: Arch, f_count: ?*usize) bool {
